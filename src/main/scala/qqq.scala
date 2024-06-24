@@ -98,11 +98,29 @@ class Chain[T](val f: Any => Any, val typeTag: Int) {
   private var nextChains: List[Chain[_]] = Nil // Should have 1 element of next callback chain if typeTag is Async
   private var value: Option[ChainContext[T]] = None
 
+  sealed trait State
+
+  class Callbacks(val chains: List[Chain[_]]) extends State {
+    def addCallback(c: Chain[_]): Callbacks = new Callbacks(c :: chains)
+  }
+
+  class Value(val value: ChainContext[T]) extends State
+
+  private val state: AtomicReference[State] = new AtomicReference[State](new Callbacks(Nil))
+
   override def toString = s"Chain(${value.orNull})"
 
-  private def addOrExecute[U](newChain: Chain[U]): Unit = value match {
-    case Some(value) => ChainExecutor.execute(newChain, value) // execute
-    case None => nextChains = newChain :: nextChains
+  @tailrec
+  private def addOrExecute[U](newChain: Chain[U]): Unit = {
+    //    value match {
+    //      case Some(value) => ChainExecutor.execute(newChain, value) // execute
+    //      case None => nextChains = newChain :: nextChains
+    //    }
+    val s = state.get()
+    s match {
+      case cs: Callbacks => if (state.compareAndSet(s, cs.addCallback(newChain))) () else addOrExecute(newChain)
+      case value: Value => ChainExecutor.execute(newChain, value.value)
+    }
   }
 
   def transform[U](f: Try[T] => Try[U]): Chain[U] = {
@@ -157,9 +175,18 @@ class Chain[T](val f: Any => Any, val typeTag: Int) {
     _ recover pf
   }
 
+  @tailrec
+  private def setValueState(v: ChainContext[T]): List[Chain[_]] = {
+    val s = state.get()
+    s match {
+      case cs: Callbacks => if (state.compareAndSet(s, new Value(v))) cs.chains else setValueState(v)
+      case _: Value => throw new IllegalStateException("Assign value to completed Future")
+    }
+  }
+
   def getChains(value: ChainContext[Any]): (ChainContext[T], List[Chain[_]]) = {
     // Should be moved to executor
-    val nValue: ChainContext[T] = typeTag match {
+    val ret@(nValue: ChainContext[T], chains) = typeTag match {
       case Chain.typeTagSync =>
         val nValue: ChainContext[T] =
           try ChainContext(f.asInstanceOf[Try[Any] => Try[T]](value.t))
@@ -168,17 +195,21 @@ class Chain[T](val f: Any => Any, val typeTag: Int) {
           }
 
         //    	val nValue: ChainContext[T] = new ChainContext(value.t.flatMap(v => f.asInstanceOf[Try[Any] => Try[T]](v)))
-        self.value = Some(nValue)
-        nValue
+        //
+        //        self.value = Some(nValue)
+        // TODO
+        val chains = setValueState(nValue)
+        (nValue -> chains)
       case Chain.typeTagAsync =>
         try {
           val nChain: Chain[T] = f.asInstanceOf[Try[Any] => Chain[T]](value.t)
+          // Save inner state?
           nChain.value.getOrElse {
             //      	ChainExecutor.execute(nChain, value)
             ChainContext.Empty.asInstanceOf[ChainContext[T]]
-          }
+          } -> Nil
         } catch {
-          case t: Throwable => ChainContext(Failure(t))
+          case t: Throwable => ChainContext[T](Failure(t)) -> Nil
         }
       //    	value.t match {
       //      	case Failure(_) => value.asInstanceOf[ChainContext[T]]
@@ -210,7 +241,8 @@ class Chain[T](val f: Any => Any, val typeTag: Int) {
     //
     //	self.value = Some(nValue)
     //	println(s"getChains(${value.t}) " + nValue.t)
-    nValue -> nextChains
+    //    nValue -> nextChains
+    ret
   }
 }
 
