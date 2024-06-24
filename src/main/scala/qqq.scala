@@ -3,52 +3,84 @@ import com.typesafe.scalalogging.{LazyLogging, Logger, StrictLogging}
 
 import java.lang.Thread.Builder
 import java.util.concurrent.{Executors, ThreadFactory}
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.annotation.tailrec
 import scala.util.{Failure, Success, Try}
 
 
 object qqqq extends App with StrictLogging {
 
+  // TODO: reimplement Promise. Fulfill promise on current thread and return Boolean on completing method
+  //  AND run it further on new VirtualThread
   val c1 = Chain(42)
-  logger.info(c1.toString)
-  logger.info(c1.map(_ + 42).toString)
+  logger.info(c1.toString) // TODO: Incomplete or complete. Virtual Thread creation is instant action and it not block caller thread
+  logger.info(c1.map(_ + 42).toString) // see above
 
   val cp1 = new ChainPromise[Int]
   val c2 = cp1.chain
-  logger.info("c2 is " + c2)
+  logger.info("c2 is " + c2) // Incomplete
   cp1.complete(22)
   Thread.sleep(5)
-  logger.info("c2 is " + c2)
+  logger.info("c2 is " + c2) // Chain(ChainContext(Success(22)))
   c2.map { v =>
-    logger.info(s"[${Thread.currentThread()}] Chain 1")
-    v + 1
+    val nVal = v + 1
+    logger.info(s"[${Thread.currentThread()}] Chain 1. $nVal") // 23
+    nVal
   }.map { v =>
-    logger.info(s"[${Thread.currentThread()}] Chain 2")
-    v + 1
+    val nVal = v + 1
+    logger.info(s"[${Thread.currentThread()}] Chain 2. $nVal") // 24
+    nVal
   }
 
   c2.map { v =>
-    logger.info(s"[${Thread.currentThread()}] Chain 3")
-    v * 2
+    val nVal = v * 2
+    logger.info(s"[${Thread.currentThread()}] Chain 3. $nVal") // 44
+    nVal
   }
 
-  c2.map { v =>
-    logger.info(s"[${Thread.currentThread()}] Chain 4")
-    throw new RuntimeException("Chain 4")
-  }
+  c2
+    .map { v =>
+      logger.info(s"[${Thread.currentThread()}] Chain 4. $v") // 22
+      throw new RuntimeException("Chain 4")
+      42
+    }
+    .andThen { case r => logger.info(s"[${Thread.currentThread()}] Chain 4 result: '$r'") }
 
   c2.flatMap { v =>
       Thread.sleep(5)
-      logger.info(s"[${Thread.currentThread()}] Chain 5")
+      logger.info(s"[${Thread.currentThread()}] Chain 5. $v")
       Chain {
         Thread.sleep(5)
         "Chain 5 value"
       }
     }
-    .map(v => logger.info(s"[${Thread.currentThread()}] Chain 5 value: '$v''"))
+    .map(v => logger.info(s"[${Thread.currentThread()}] Chain 5 value: '$v'"))
+
+  val promiseC3 = new ChainPromise[Int]
+  val c3 = promiseC3.chain
+  promiseC3.complete(42)
+
+  c2.flatMap { v =>
+      logger.info(s"[${Thread.currentThread()}] Chain 6. $v")
+      c3.map(_ + 42)
+    }
+    .map(v => logger.info(s"[${Thread.currentThread()}] Chain 6 value: '$v'"))
+
 
   Thread.sleep(100)
+
+  {
+    logger.info("Virtual tread")
+    val start = System.nanoTime()
+    logger.info(s"Before start.")
+    Thread.ofVirtual().start { () =>
+      val started = System.nanoTime()
+      logger.info(s"In start. ${started - start}")
+    }
+    val finished = System.nanoTime()
+    logger.info(s"Before finished. ${finished - start}")
+  }
+  Thread.sleep(10)
 
 }
 
@@ -95,8 +127,6 @@ object ChainContext {
  */
 class Chain[T](val f: Any => Any, val typeTag: Int) {
   self =>
-  private var nextChains: List[Chain[_]] = Nil // Should have 1 element of next callback chain if typeTag is Async
-  private var value: Option[ChainContext[T]] = None
 
   sealed trait State
 
@@ -106,22 +136,21 @@ class Chain[T](val f: Any => Any, val typeTag: Int) {
 
   class Value(val value: ChainContext[T]) extends State
 
+  def value: Option[ChainContext[T]] = state.get() match {
+    case v: Value => Some(v.value)
+    case _ => None
+  }
+
   private val state: AtomicReference[State] = new AtomicReference[State](new Callbacks(Nil))
 
-  override def toString = s"Chain(${value.orNull})"
+  override def toString = s"Chain(${value.getOrElse("<Incomplete>")})"
 
   @tailrec
-  private def addOrExecute[U](newChain: Chain[U]): Unit = {
-    //    value match {
-    //      case Some(value) => ChainExecutor.execute(newChain, value) // execute
-    //      case None => nextChains = newChain :: nextChains
-    //    }
-    val s = state.get()
-    s match {
-      case cs: Callbacks => if (state.compareAndSet(s, cs.addCallback(newChain))) () else addOrExecute(newChain)
+  private def addOrExecute[U](newChain: Chain[U]): Unit =
+    state.get() match {
+      case cs: Callbacks => if (state.compareAndSet(cs, cs.addCallback(newChain))) () else addOrExecute(newChain)
       case value: Value => ChainExecutor.execute(newChain, value.value)
     }
-  }
 
   def transform[U](f: Try[T] => Try[U]): Chain[U] = {
     val newChain = new Chain[U](f.asInstanceOf[Any => Any], Chain.typeTagSync)
@@ -131,117 +160,82 @@ class Chain[T](val f: Any => Any, val typeTag: Int) {
   }
 
   // Better impl for FlatMaps? adapter for chain that is still to come. OR use callbacks to propagate Value to ChainWrapper
+  // Current implementation wrap provided function to complete Promise with value of function result AND returning link on Future of promise
+  // On Execution, Function just run and not continue the execution. TODO Could be corner cases
   def transformWith[U](f: Try[T] => Chain[U]): Chain[U] = {
     val promise = new ChainPromise[U]
-    val wrappedDeferredChainFunc: Try[T] => Chain[U] =
-      (t: Try[T]) =>
-        f(t).transform { t =>
-          promise.completeTry(t)
-          t
-        }
+    val wrappedDeferredChainFunc: Try[T] => Chain[U] = { (t: Try[T]) =>
+      try f(t).andThen { t => promise.completeTry(t) }
+      catch {
+        case t: Throwable =>
+          promise.fail(t)
+          Chain.failed(t)
+      }
+    }
     val newChain = new Chain[U](wrappedDeferredChainFunc.asInstanceOf[Any => Any], Chain.typeTagAsync)
     addOrExecute(newChain)
 
     promise.chain
   }
 
+  def onComplete(f: Try[T] => Unit): Unit = {
+    val newChain = new Chain(f.asInstanceOf[Any => Any], Chain.typeTagSync)
+    addOrExecute(newChain)
+  }
+
+  def andThen[U](f: PartialFunction[Try[T], U]): Chain[T] = {
+    val newChain = new Chain[U](f.lift.asInstanceOf[Any => Any], Chain.typeTagSync)
+    addOrExecute(newChain)
+
+    this
+  }
+
   def map[U](f: T => U): Chain[U] = transform {
     _.map(f)
   }
-  //  {
-  //	val newChain = new Chain[U](f.asInstanceOf[Any => Any], Chain.typeTagSync)
-  //	value match {
-  //  	case Some(value) => ChainExecutor.execute(newChain, value) // execute
-  //  	case None    	=> nextChains = newChain :: nextChains
-  //	}
-  //
-  //	newChain
-  //  }
 
   def flatMap[U](f: T => Chain[U]): Chain[U] = transformWith {
     case Success(value) => f(value)
     case Failure(e) => Chain.failed[U](e)
   }
-  //  {
-  //	val promise = new ChainPromise[U]
-  //	val wrappedDeferredChainFunc: T => Chain[Unit] = (t: T) => f(t).map(promise.complete)
-  //	val newChain = new Chain[U](wrappedDeferredChainFunc.asInstanceOf[Any => Any], Chain.typeTagAsync)
-  //	addOrExecute(newChain)
-  //
-  //	promise.chain
-  //  }
 
   def recover[U >: T](pf: PartialFunction[Throwable, U]): Chain[U] = transform {
-    _ recover pf
+    _.recover(pf)
+  }
+
+  def recoverWith[U >: T](pf: PartialFunction[Throwable, Chain[U]]): Chain[U] = transformWith {
+    case Failure(ex) if pf.isDefinedAt(ex) => pf(ex)
+    case _ => this.asInstanceOf[Chain[U]]
   }
 
   @tailrec
-  private def setValueState(v: ChainContext[T]): List[Chain[_]] = {
-    val s = state.get()
-    s match {
-      case cs: Callbacks => if (state.compareAndSet(s, new Value(v))) cs.chains else setValueState(v)
+  private def setValueState(v: ChainContext[T]): List[Chain[_]] =
+    state.get() match {
+      case cs: Callbacks => if (state.compareAndSet(cs, new Value(v))) cs.chains else setValueState(v)
       case _: Value => throw new IllegalStateException("Assign value to completed Future")
     }
-  }
 
   def getChains(value: ChainContext[Any]): (ChainContext[T], List[Chain[_]]) = {
     // Should be moved to executor
-    val ret@(nValue: ChainContext[T], chains) = typeTag match {
+    val ret: (ChainContext[T], List[Chain[_]]) = typeTag match {
       case Chain.typeTagSync =>
         val nValue: ChainContext[T] =
           try ChainContext(f.asInstanceOf[Try[Any] => Try[T]](value.t))
           catch {
             case t: Throwable => ChainContext(Failure(t))
           }
-
-        //    	val nValue: ChainContext[T] = new ChainContext(value.t.flatMap(v => f.asInstanceOf[Try[Any] => Try[T]](v)))
-        //
-        //        self.value = Some(nValue)
-        // TODO
         val chains = setValueState(nValue)
-        (nValue -> chains)
+        nValue -> chains
       case Chain.typeTagAsync =>
-        try {
+        val nContext = try {
           val nChain: Chain[T] = f.asInstanceOf[Try[Any] => Chain[T]](value.t)
           // Save inner state?
-          nChain.value.getOrElse {
-            //      	ChainExecutor.execute(nChain, value)
-            ChainContext.Empty.asInstanceOf[ChainContext[T]]
-          } -> Nil
+          nChain.value.getOrElse(ChainContext.Empty.asInstanceOf[ChainContext[T]])
         } catch {
-          case t: Throwable => ChainContext[T](Failure(t)) -> Nil
+          case t: Throwable => ChainContext[T](Failure(t))
         }
-      //    	value.t match {
-      //      	case Failure(_) => value.asInstanceOf[ChainContext[T]]
-      //      	case Success(value) =>
-      //        	try {
-      //          	val nChain: Chain[T] = f.asInstanceOf[Try[Any] => Chain[T]](value)
-      //          	nChain.value.getOrElse {
-      //            	//      	ChainExecutor.execute(nChain, value)
-      //            	ChainContext.Empty.asInstanceOf[ChainContext[T]]
-      //          	}
-      //        	} catch {
-      //          	case t: Throwable => ChainContext(Failure(t))
-      //        	}
-      //    	}
-
+        nContext -> Nil
     }
-    //	val nValue = new ChainContext(value.t.map(v => f.asInstanceOf[Any => T](v)))
-    //	self.value = Some(nValue)
-    //	value.t match {
-    //  	case Failure(e) => self.value = Some(value.asInstanceOf[ChainContext[T]])
-    //  	case Success(value)      	=>
-    //    	try {
-    //      	val nValue = new ChainContext(f(value.))
-    //      	self.value = Some(nValue)
-    //    	} catch {
-    //      	case e: Throwable => throw e
-    //    	}
-    //	}
-    //
-    //	self.value = Some(nValue)
-    //	println(s"getChains(${value.t}) " + nValue.t)
-    //    nValue -> nextChains
     ret
   }
 }
@@ -269,14 +263,19 @@ object Chain {
 }
 
 class ChainPromise[T] {
-  val chain: Chain[T] = new Chain[T](r => r.asInstanceOf[T], Chain.typeTagSync)
+  private val completed: AtomicBoolean = new AtomicBoolean(false)
+  val chain: Chain[T] = new Chain[T](identity, Chain.typeTagSync)
 
-  // TODO: Should return boolean if value was set
-  def complete(value: T): Unit = ChainExecutor.execute(chain, ChainContext(value))
+  def complete(value: T): Boolean = completeTry(Success(value))
 
-  def fail(value: Throwable): Unit = ChainExecutor.execute(chain, new ChainContext[T](Failure(value)))
+  def fail(value: Throwable): Boolean = completeTry(Failure(value))
 
-  def completeTry(t: Try[T]): Unit = ChainExecutor.execute(chain, new ChainContext[T](t))
+  // TODO: improve Boolean value. Complete on caller thread???
+  def completeTry(t: Try[T]): Boolean =
+    if (completed.compareAndSet(false, true)) {
+      ChainExecutor.execute(chain, new ChainContext[T](t))
+      true
+    } else false
 }
 
 object ChainExecutor {
@@ -320,7 +319,4 @@ object ChainExecutor {
     Thread.currentThread().join()
   }
 
-  // vt1 -- C1
-  // C1 -- vt1 --> .map -- vt1 --> .map -- vt1 --> .map
-  // C1 -- vt2 --> .andThen
 }
